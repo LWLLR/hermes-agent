@@ -47,7 +47,7 @@ import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -1783,6 +1783,113 @@ def _refresh_provider_credentials(provider: str) -> bool:
     return False
 
 
+def _build_fallback_try_fn(runtime: Dict[str, Any], label: str
+                           ) -> Tuple[Any, Optional[str]]:
+    """Build a (client, model) pair from a resolved fallback provider runtime dict.
+
+    Mirrors the logic in _resolve_api_key_provider but works from a pre-resolved
+    runtime so we can support ``auxiliary.fallback_providers`` config.
+    """
+    from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+    base_url = str(runtime.get("base_url", "")).strip().rstrip("/")
+    api_key = str(runtime.get("api_key", "")).strip()
+    model = str(runtime.get("model", "")).strip()
+    api_mode = str(runtime.get("api_mode", "")).strip() or _detect_api_mode_for_url(base_url)
+
+    if not base_url or not api_key:
+        return None, None
+
+    extra = {}
+    from agent.auxiliary_client import base_url_host_matches
+    if base_url_host_matches(base_url, "api.kimi.com"):
+        extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+
+    if api_mode == "anthropic_messages":
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+            real_client = build_anthropic_client(api_key, base_url)
+            from agent.auxiliary_client import AnthropicAuxiliaryClient
+            return AnthropicAuxiliaryClient(real_client, model or "kimi-k2-turbo-preview",
+                                             api_key, base_url, is_oauth=False), model or None
+        except ImportError:
+            pass
+
+    from agent.auxiliary_client import OpenAI
+    client = OpenAI(api_key=api_key, base_url=base_url, **extra)
+    from agent.auxiliary_client import _maybe_wrap_anthropic
+    client = _maybe_wrap_anthropic(client, model or "gpt-4o-mini", api_key, base_url, api_mode)
+    return client, model or None
+
+
+def _resolve_aux_fallback_providers() -> List[Tuple[str, Callable]]:
+    """Read ``auxiliary.fallback_providers`` from config and return a provider chain.
+
+    Each entry in the list follows the same format as the main model's
+    ``fallback_providers``::
+
+        auxiliary:
+          fallback_providers:
+          - provider: kimi-coding-cn
+            model: kimi-k2.6
+            base_url: https://api.kimi.com/coding
+
+    Entries are prepended to the hardcoded auto-detection chain so user-specified
+    providers are always tried before the built-in fallbacks.
+    """
+    from hermes_cli.config import load_config
+    try:
+        cfg = load_config()
+    except Exception:
+        return []
+
+    aux = cfg.get("auxiliary", {})
+    raw_fbs = aux.get("fallback_providers", [])
+    if not isinstance(raw_fbs, list):
+        return []
+
+    result = []
+    for i, entry in enumerate(raw_fbs):
+        if not isinstance(entry, dict):
+            continue
+        provider_name = str(entry.get("provider", "")).strip()
+        model = str(entry.get("model", "")).strip()
+        base_url = str(entry.get("base_url", "")).strip()
+        if not provider_name:
+            continue
+
+        # Build label: use explicit base_url as part of label for uniqueness,
+        # falling back to provider name alone.
+        label = f"aux_fb_{i}:{provider_name}" if base_url else f"aux_fb_{i}:{provider_name}"
+
+        def make_try_fn(pn=provider_name, mdl=model, burl=base_url):
+            def try_fn() -> Tuple[Any, Optional[str]]:
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    runtime = resolve_runtime_provider(requested=pn)
+                    if not isinstance(runtime, dict):
+                        return None, None
+                    resolved_base = runtime.get("base_url", "") or burl
+                    resolved_key = runtime.get("api_key", "") or ""
+                    resolved_model = runtime.get("model", "") or mdl
+                    resolved_mode = runtime.get("api_mode", "")
+                    if not resolved_base:
+                        return None, None
+                    merged = dict(runtime)
+                    if burl:
+                        merged["base_url"] = burl
+                    if mdl:
+                        merged["model"] = mdl
+                    return _build_fallback_try_fn(merged, label)
+                except Exception:
+                    return None, None
+            return try_fn
+
+        result.append((label, make_try_fn()))
+
+    return result
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -1791,7 +1898,8 @@ def _try_payment_fallback(
     """Try alternative providers after a payment/credit or connection error.
 
     Iterates the standard auto-detection chain, skipping the provider that
-    failed.
+    failed.  User-configured ``auxiliary.fallback_providers`` are prepended
+    to the chain so explicit fallbacks are always tried first.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -1810,7 +1918,21 @@ def _try_payment_fallback(
                        "custom": "local/custom", "local/custom": "local/custom"}
     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
 
+    # User-configured auxiliary fallback providers (take priority)
     tried = []
+    for label, try_fn in _resolve_aux_fallback_providers():
+        if label in skip_chain_labels:
+            continue
+        client, model = try_fn()
+        if client is not None:
+            logger.info(
+                "Auxiliary %s: %s on %s — falling back to aux_fb %s (%s)",
+                task or "call", reason, failed_provider, label, model or "default",
+            )
+            return client, model, label
+        tried.append(label)
+
+    # Hardcoded auto-detection chain
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
             continue
