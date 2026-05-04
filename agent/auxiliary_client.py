@@ -1890,6 +1890,63 @@ def _resolve_aux_fallback_providers() -> List[Tuple[str, Callable]]:
     return result
 
 
+def _cfg_fallback_providers() -> List[Tuple[str, Callable]]:
+    """Read ``fallback_providers`` from the top-level config.
+
+    Mirrors the logic of ``_resolve_aux_fallback_providers`` but reads the
+    top-level key so auxiliary models inherit the main model's fallback chain
+    without requiring a separate ``auxiliary.fallback_providers`` entry.
+    """
+    from hermes_cli.config import load_config
+    try:
+        cfg = load_config()
+    except Exception:
+        return []
+
+    raw_fbs = cfg.get("fallback_providers", [])
+    if not isinstance(raw_fbs, list):
+        return []
+
+    result = []
+    for i, entry in enumerate(raw_fbs):
+        if not isinstance(entry, dict):
+            continue
+        provider_name = str(entry.get("provider", "")).strip()
+        model = str(entry.get("model", "")).strip()
+        base_url = str(entry.get("base_url", "")).strip()
+        if not provider_name:
+            continue
+
+        label = f"main_fb:{provider_name}"
+
+        def make_try_fn(pn=provider_name, mdl=model, burl=base_url):
+            def try_fn() -> Tuple[Any, Optional[str]]:
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    runtime = resolve_runtime_provider(requested=pn)
+                    if not isinstance(runtime, dict):
+                        return None, None
+                    resolved_base = runtime.get("base_url", "") or burl
+                    resolved_key = runtime.get("api_key", "") or ""
+                    resolved_model = runtime.get("model", "") or mdl
+                    resolved_mode = runtime.get("api_mode", "")
+                    if not resolved_base:
+                        return None, None
+                    merged = dict(runtime)
+                    if burl:
+                        merged["base_url"] = burl
+                    if mdl:
+                        merged["model"] = mdl
+                    return _build_fallback_try_fn(merged, label)
+                except Exception:
+                    return None, None
+            return try_fn
+
+        result.append((label, make_try_fn()))
+
+    return result
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -1927,6 +1984,20 @@ def _try_payment_fallback(
         if client is not None:
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to aux_fb %s (%s)",
+                task or "call", reason, failed_provider, label, model or "default",
+            )
+            return client, model, label
+        tried.append(label)
+
+    # Main-model fallback providers (inherit from model.fallback_providers)
+    for entry in _cfg_fallback_providers():
+        label, try_fn = entry
+        if label in skip_chain_labels:
+            continue
+        client, model = try_fn()
+        if client is not None:
+            logger.info(
+                "Auxiliary %s: %s on %s — falling back to main_fb %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
             )
             return client, model, label
